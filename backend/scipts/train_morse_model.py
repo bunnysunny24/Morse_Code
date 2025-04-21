@@ -404,8 +404,6 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
             features_batch = synthetic_features[batch_idx:batch_end]
             labels_batch = synthetic_labels[batch_idx:batch_end]
             
-            # Add channel dimension for Conv2D
-            
             # Process and save this batch
             process_batch_and_save(features_batch, labels_batch, 
                                   batch_idx//batch_size + 1, max_time_steps, output_file)
@@ -494,14 +492,22 @@ def train_model(model, dataset_file, batch_size=32, epochs=50, model_path='morse
     class HDF5DataGenerator(keras.utils.Sequence):
         def __init__(self, h5_file, indices, batch_size=32):
             self.h5_file = h5_file
-            self.indices = indices
+            self.indices = np.array(indices)  # Convert to numpy array for easier manipulation
             self.batch_size = batch_size
             
         def __len__(self):
             return (len(self.indices) + self.batch_size - 1) // self.batch_size
         
+        def on_epoch_end(self):
+            # Shuffle indices at the end of each epoch
+            np.random.shuffle(self.indices)
+            
         def __getitem__(self, idx):
-            batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+            # Get the indices for this batch
+            batch_indices = self.indices[idx * self.batch_size:min((idx + 1) * self.batch_size, len(self.indices))]
+            
+            # Sort indices for HDF5 compatibility
+            batch_indices = np.sort(batch_indices)
             
             with h5py.File(self.h5_file, 'r') as f:
                 batch_features = f['features'][batch_indices]
@@ -554,13 +560,14 @@ def train_model(model, dataset_file, batch_size=32, epochs=50, model_path='morse
         )
     ]
     
-    # Train the model
+    # Train the model with shuffle=True to enable shuffling between epochs
     history = model.fit(
         train_generator,
         validation_data=val_generator,
         epochs=epochs,
         callbacks=callbacks,
-        verbose=1
+        verbose=1,
+        shuffle=True
     )
     
     print(f"Epoch checkpoints saved to: {checkpoints_dir}")
@@ -631,7 +638,7 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum number of samples to load')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs for training')
-    parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model_v2.h5'), 
+    parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model_v3.h5'), 
                        help='Path to save model')
     parser.add_argument('--test_file', help='Audio file to test after training')
     parser.add_argument('--sample_limit', type=int, default=20000, help='Maximum samples per class (for balance)')
@@ -698,7 +705,7 @@ def main():
     # Plot training history
     plot_training_history(history)
     
-    # Save the final model as latest_model_v2.h5
+    # Save the final model as latest_model_v3.h5
     final_model_path = os.path.join(save_dir, 'latest_model_v3.h5')
     model.save(final_model_path)
     print(f"Final model saved as '{final_model_path}'")
