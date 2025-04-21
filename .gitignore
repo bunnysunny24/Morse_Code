@@ -25,3 +25,4 @@ yarn-error.log*
 *.wav
 *.mp3
 backend/scipts/morse_audio_dataset/
+.h5
