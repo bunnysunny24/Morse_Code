@@ -12,6 +12,7 @@ from tqdm import tqdm
 import gc  # Garbage collection for memory management
 import datetime
 import h5py  # For efficient storage of large arrays
+import random  # For random shuffling
 
 # Create the directory for saved models if it doesn't exist
 save_dir = r"D:\Bunny\MorseCode\backend\scipts\saved_models"
@@ -132,6 +133,58 @@ def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_ste
     del standardized_batch
     gc.collect()
 
+def generate_synthetic_pause_samples(num_samples=1000, is_long=False, max_time_steps=None):
+    """
+    Generate synthetic audio for pause samples
+    
+    Args:
+        num_samples: Number of samples to generate
+        is_long: Whether to generate long pauses (True) or short pauses (False)
+        max_time_steps: Maximum time steps for consistency with real data
+        
+    Returns:
+        List of synthetic mel spectrograms and their labels
+    """
+    print(f"Generating {num_samples} synthetic {'long' if is_long else 'short'} pause samples...")
+    
+    features_list = []
+    labels_list = []
+    pause_type = 'long_pause' if is_long else 'short_pause'
+    
+    duration = 0.7 if is_long else 0.3  # Long pause vs short pause duration
+    sr = SAMPLE_RATE
+    
+    for i in range(num_samples):
+        # Generate mostly silence with small random noise
+        y = np.random.normal(0, 0.01, int(sr * duration))
+        
+        # Extract features
+        mel_spec = librosa.feature.melspectrogram(
+            y=y, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS
+        )
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        mel_spec_db = (mel_spec_db - np.min(mel_spec_db)) / (np.max(mel_spec_db) - np.min(mel_spec_db))
+        
+        # Add small variations to make each sample slightly unique
+        mel_spec_db += np.random.normal(0, 0.01, mel_spec_db.shape)
+        mel_spec_db = np.clip(mel_spec_db, 0, 1)  # Keep in valid range
+        
+        # Pad to max_time_steps if provided
+        if max_time_steps is not None:
+            freq_bins, time_steps = mel_spec_db.shape
+            padded_feat = np.zeros((freq_bins, max_time_steps))
+            padded_feat[:, :min(time_steps, max_time_steps)] = mel_spec_db[:, :min(time_steps, max_time_steps)]
+            mel_spec_db = padded_feat
+        
+        features_list.append(mel_spec_db)
+        
+        # Create one-hot label
+        label = [0] * len(MORSE_ELEMENTS)
+        label[MORSE_ELEMENTS.index(pause_type)] = 1
+        labels_list.append(label)
+    
+    return features_list, labels_list
+
 def create_model(input_shape, num_classes=4):
     """
     Create a CNN model for audio classification
@@ -201,18 +254,73 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     total_files = len(file_names)
     print(f"Found {total_files} labeled files")
     
-    # Count and limit samples per class to prevent imbalance
+    # Count samples per class
     class_counts = {element: 0 for element in MORSE_ELEMENTS}
     filtered_files = []
+    file_by_class = {element: [] for element in MORSE_ELEMENTS}
     
     for file_name in file_names:
         if not labels[file_name]:  # Skip files with empty labels
             continue
             
         morse_element = labels[file_name][0]  # Use first element as label
-        if morse_element in MORSE_ELEMENTS and class_counts[morse_element] < sample_limit_per_class:
-            filtered_files.append(file_name)
+        if morse_element in MORSE_ELEMENTS:
             class_counts[morse_element] += 1
+            file_by_class[morse_element].append(file_name)
+    
+    print("Initial class counts:")
+    for element, count in class_counts.items():
+        print(f"  {element}: {count} samples")
+    
+    # Check if we have a balanced dataset or need to create one
+    missing_classes = [cls for cls, count in class_counts.items() if count == 0]
+    
+    if missing_classes:
+        print(f"Missing samples for classes: {', '.join(missing_classes)}")
+        print("Creating balanced dataset...")
+        
+        # Get available classes and their counts
+        available_classes = [cls for cls, count in class_counts.items() if count > 0]
+        
+        # Determine target count per class (equal samples per class)
+        if len(available_classes) == 0:
+            print("Error: No valid classes found in dataset")
+            return 0
+        
+        # For dot and dash only, create balanced classes
+        samples_per_class = min(class_counts['dot'], class_counts['dash']) 
+        if max_samples and (samples_per_class * 2 > max_samples):
+            samples_per_class = max_samples // 2  # Divide evenly between classes
+        
+        samples_per_class = min(samples_per_class, sample_limit_per_class)
+        print(f"Balancing to {samples_per_class} samples per class")
+        
+        # Randomly shuffle files in each class
+        for cls in available_classes:
+            random.shuffle(file_by_class[cls])
+        
+        # Create balanced dataset
+        balanced_files = []
+        balanced_counts = {element: 0 for element in MORSE_ELEMENTS}
+        
+        for cls in available_classes:
+            balanced_files.extend(file_by_class[cls][:samples_per_class])
+            balanced_counts[cls] = min(len(file_by_class[cls]), samples_per_class)
+        
+        filtered_files = balanced_files
+        class_counts = balanced_counts
+    else:
+        # If we have all classes, just apply sample limit
+        for cls in MORSE_ELEMENTS:
+            if len(file_by_class[cls]) > sample_limit_per_class:
+                random.shuffle(file_by_class[cls])
+                file_by_class[cls] = file_by_class[cls][:sample_limit_per_class]
+                class_counts[cls] = sample_limit_per_class
+        
+        # Combine all files
+        filtered_files = []
+        for cls_files in file_by_class.values():
+            filtered_files.extend(cls_files)
     
     print(f"Using {len(filtered_files)} files after balancing classes")
     for element, count in class_counts.items():
@@ -245,7 +353,50 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     del features_sample
     gc.collect()
     
-    # Process all files in batches
+    # Check for missing classes and generate synthetic data if needed
+    synthetic_features = []
+    synthetic_labels = []
+    
+    if class_counts['short_pause'] == 0:
+        # Generate synthetic short pause samples
+        short_pause_features, short_pause_labels = generate_synthetic_pause_samples(
+            num_samples=samples_per_class,
+            is_long=False,
+            max_time_steps=max_time_steps
+        )
+        synthetic_features.extend(short_pause_features)
+        synthetic_labels.extend(short_pause_labels)
+        class_counts['short_pause'] = samples_per_class
+    
+    if class_counts['long_pause'] == 0:
+        # Generate synthetic long pause samples
+        long_pause_features, long_pause_labels = generate_synthetic_pause_samples(
+            num_samples=samples_per_class,
+            is_long=True,
+            max_time_steps=max_time_steps
+        )
+        synthetic_features.extend(long_pause_features)
+        synthetic_labels.extend(long_pause_labels)
+        class_counts['long_pause'] = samples_per_class
+    
+    # Process synthetic data first if we have any
+    if synthetic_features:
+        print(f"Processing {len(synthetic_features)} synthetic samples...")
+        
+        for batch_idx in range(0, len(synthetic_features), batch_size):
+            batch_end = min(batch_idx + batch_size, len(synthetic_features))
+            features_batch = synthetic_features[batch_idx:batch_end]
+            labels_batch = synthetic_labels[batch_idx:batch_end]
+            
+            # Add channel dimension for Conv2D
+            features_batch = [np.expand_dims(feat, axis=-1) for feat in features_batch]
+            
+            # Process and save this batch
+            process_batch_and_save(features_batch, labels_batch, 
+                                  batch_idx//batch_size + 1, max_time_steps, output_file)
+    
+    # Process real audio files
+    print(f"Processing {len(filtered_files)} real audio samples...")
     for batch_idx in range(0, len(filtered_files), batch_size):
         batch_files = filtered_files[batch_idx:batch_idx + batch_size]
         
@@ -281,7 +432,9 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
                 print(f"Error processing {file_path}: {e}")
         
         # Process and save this batch
-        process_batch_and_save(features_batch, labels_batch, batch_idx//batch_size + 1, max_time_steps, output_file)
+        process_batch_and_save(features_batch, labels_batch, 
+                              (batch_idx//batch_size + 1) + (len(synthetic_features)//batch_size + 1),
+                              max_time_steps, output_file)
         
         # Clear memory
         del features_batch, labels_batch
@@ -290,6 +443,11 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     # Print dataset info
     with h5py.File(output_file, 'r') as f:
         print(f"Final dataset size: {f['features'].shape}")
+        
+    # Print updated class counts
+    print("Final class distribution:")
+    for element, count in class_counts.items():
+        print(f"  {element}: {count} samples")
     
     return max_time_steps
 
@@ -306,7 +464,7 @@ def train_model(model, dataset_file, batch_size=32, epochs=50, model_path='morse
     """
     # Get directory from model_path
     model_dir = os.path.dirname(model_path)
-    latest_model_path = os.path.join(model_dir, 'latest_model_v2.h5')
+    latest_model_path = os.path.join(model_dir, 'latest_model_v3.h5')
     
     # Create a directory for epoch checkpoints
     checkpoints_dir = os.path.join(model_dir, 'epoch_checkpoints')
@@ -387,9 +545,7 @@ def train_model(model, dataset_file, batch_size=32, epochs=50, model_path='morse
         validation_data=val_generator,
         epochs=epochs,
         callbacks=callbacks,
-        verbose=1,
-        use_multiprocessing=True,
-        workers=4
+        verbose=1
     )
     
     print(f"Epoch checkpoints saved to: {checkpoints_dir}")
@@ -420,7 +576,7 @@ def plot_training_history(history):
     # Save the plot to the same directory as the model
     plots_dir = save_dir
     os.makedirs(plots_dir, exist_ok=True)
-    plot_path = os.path.join(plots_dir, 'training_history_v2.png')
+    plot_path = os.path.join(plots_dir, 'training_history_v3.png')
     plt.tight_layout()
     plt.savefig(plot_path)
     print(f"Training history plot saved to {plot_path}")
@@ -474,7 +630,7 @@ def main():
     print(f"Using dataset: {args.dataset}")
     print(f"Using labels: {args.labels}")
     print(f"Model will be saved to: {args.model_path}")
-    print(f"Latest model will be saved as: {os.path.join(save_dir, 'latest_model_v2.h5')}")
+    print(f"Latest model will be saved as: {os.path.join(save_dir, 'latest_model_v3.h5')}")
     print(f"Per-epoch checkpoints will be saved in: {os.path.join(save_dir, 'epoch_checkpoints')}")
     
     # Check if dataset and labels exist
@@ -488,6 +644,11 @@ def main():
     
     # Path for processed dataset
     h5_dataset = os.path.join(temp_dir, 'morse_dataset.h5')
+    
+    # Remove existing dataset file if it exists
+    if os.path.exists(h5_dataset):
+        print(f"Removing existing dataset file: {h5_dataset}")
+        os.remove(h5_dataset)
     
     # Process and save dataset
     print("Processing dataset and saving to HDF5...")
@@ -523,7 +684,7 @@ def main():
     plot_training_history(history)
     
     # Save the final model as latest_model_v2.h5
-    final_model_path = os.path.join(save_dir, 'latest_model_v2.h5')
+    final_model_path = os.path.join(save_dir, 'latest_model_v3.h5')
     model.save(final_model_path)
     print(f"Final model saved as '{final_model_path}'")
     
@@ -556,5 +717,10 @@ if __name__ == "__main__":
             print(f"Memory growth enabled for {len(gpus)} GPUs")
     except:
         print("No GPU available or could not configure memory growth")
+    
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    random.seed(42)
+    tf.random.set_seed(42)
     
     main()
