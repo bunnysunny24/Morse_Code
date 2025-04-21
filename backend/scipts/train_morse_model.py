@@ -11,10 +11,15 @@ import argparse
 from tqdm import tqdm
 import gc  # Garbage collection for memory management
 import datetime
+import h5py  # For efficient storage of large arrays
 
 # Create the directory for saved models if it doesn't exist
 save_dir = r"D:\Bunny\MorseCode\backend\scipts\saved_models"
 os.makedirs(save_dir, exist_ok=True)
+
+# Create a directory for temporary storage
+temp_dir = os.path.join(save_dir, "temp_data")
+os.makedirs(temp_dir, exist_ok=True)
 
 # Constants
 SAMPLE_RATE = 22050
@@ -23,6 +28,7 @@ N_MELS = 128
 N_FFT = 2048
 HOP_LENGTH = 512
 MORSE_ELEMENTS = ['dot', 'dash', 'short_pause', 'long_pause']
+BATCH_SIZE_PROCESSING = 1000  # Process data in smaller batches to reduce memory usage
 
 # Morse code dictionary for decoding (expanded with punctuation)
 MORSE_TO_TEXT = {
@@ -70,27 +76,26 @@ def load_and_preprocess_audio(file_path, fixed_time_steps=None):
     # Normalize
     mel_spec_db = (mel_spec_db - np.min(mel_spec_db)) / (np.max(mel_spec_db) - np.min(mel_spec_db))
     
+    # If fixed_time_steps is provided, resize the spectrogram
+    if fixed_time_steps is not None and mel_spec_db.shape[1] > fixed_time_steps:
+        # Trim if longer than fixed_time_steps
+        mel_spec_db = mel_spec_db[:, :fixed_time_steps]
+    
     return mel_spec_db
 
-def standardize_feature_shape(features_list):
-    """
-    Standardize the shape of all feature arrays to match the max time dimension
+def find_max_time_steps(features_list):
+    """Find the maximum time steps across all features"""
+    max_time = 0
+    for feat in features_list:
+        if feat.shape[1] > max_time:
+            max_time = feat.shape[1]
+    return max_time
+
+def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_steps, output_file):
+    """Process a batch of features and save to HDF5"""
+    standardized_batch = []
     
-    Args:
-        features_list: List of features, each with shape [freq_bins, time_steps]
-        
-    Returns:
-        List of standardized features, each with shape [freq_bins, max_time_steps]
-        Max time steps value
-    """
-    # Find max time dimension across all features
-    max_time_steps = max(feat.shape[1] for feat in features_list)
-    print(f"Maximum time steps across all spectrograms: {max_time_steps}")
-    
-    # Standardize all features to have the same time dimension through padding
-    standardized_features = []
-    
-    for feat in tqdm(features_list, desc="Padding spectrograms"):
+    for feat in tqdm(features_batch, desc=f"Processing batch {batch_idx}"):
         # Current shape and dimensions
         freq_bins, time_steps = feat.shape
         
@@ -100,9 +105,32 @@ def standardize_feature_shape(features_list):
         # Copy original data
         padded_feat[:, :time_steps] = feat
         
-        standardized_features.append(padded_feat)
+        # Add channel dimension for Conv2D
+        padded_feat = np.expand_dims(padded_feat, axis=-1)
+        standardized_batch.append(padded_feat)
     
-    return standardized_features, max_time_steps
+    # Convert to array
+    standardized_batch = np.array(standardized_batch)
+    
+    # Save batch to HDF5 file
+    with h5py.File(output_file, 'a') as f:
+        # Create dataset for this batch if it doesn't exist
+        if 'features' not in f:
+            f.create_dataset('features', data=standardized_batch, maxshape=(None, *standardized_batch.shape[1:]), 
+                           chunks=True, compression='gzip', compression_opts=4)
+            f.create_dataset('labels', data=np.array(labels_batch), maxshape=(None, len(labels_batch[0])), 
+                           chunks=True)
+        else:
+            # Append to existing dataset
+            f['features'].resize((f['features'].shape[0] + standardized_batch.shape[0]), axis=0)
+            f['features'][-standardized_batch.shape[0]:] = standardized_batch
+            
+            f['labels'].resize((f['labels'].shape[0] + len(labels_batch)), axis=0)
+            f['labels'][-len(labels_batch):] = np.array(labels_batch)
+    
+    # Clean up memory
+    del standardized_batch
+    gc.collect()
 
 def create_model(input_shape, num_classes=4):
     """
@@ -147,18 +175,16 @@ def create_model(input_shape, num_classes=4):
     
     return model
 
-def load_dataset(dataset_path, label_file, max_samples=None):
+def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=None, sample_limit_per_class=20000):
     """
-    Load dataset from directory
+    Process dataset and save to HDF5 file to avoid memory issues
     
     Args:
         dataset_path: Path to directory containing audio files
         label_file: Path to JSON file containing labels
+        output_file: Path to output HDF5 file
         max_samples: Maximum number of samples to load (useful for testing)
-        
-    Returns:
-        features_list: List of audio features
-        labels_list: List of one-hot encoded labels
+        sample_limit_per_class: Maximum number of samples per class to balance the dataset
     """
     # Load labels from JSON file
     print(f"Loading labels from {label_file}")
@@ -175,43 +201,108 @@ def load_dataset(dataset_path, label_file, max_samples=None):
     total_files = len(file_names)
     print(f"Found {total_files} labeled files")
     
-    # Process all files
-    features_list = []
-    labels_list = []
+    # Count and limit samples per class to prevent imbalance
+    class_counts = {element: 0 for element in MORSE_ELEMENTS}
+    filtered_files = []
     
-    for file_name in tqdm(file_names, desc="Processing audio files"):
+    for file_name in file_names:
+        if not labels[file_name]:  # Skip files with empty labels
+            continue
+            
+        morse_element = labels[file_name][0]  # Use first element as label
+        if morse_element in MORSE_ELEMENTS and class_counts[morse_element] < sample_limit_per_class:
+            filtered_files.append(file_name)
+            class_counts[morse_element] += 1
+    
+    print(f"Using {len(filtered_files)} files after balancing classes")
+    for element, count in class_counts.items():
+        print(f"  {element}: {count} samples")
+    
+    # Process data in batches to reduce memory usage
+    batch_size = BATCH_SIZE_PROCESSING
+    
+    # First, find the max time steps across a subset of samples
+    # This avoids loading all samples just to find the maximum
+    time_steps_sample = min(1000, len(filtered_files))
+    print(f"Analyzing {time_steps_sample} samples to find max time steps...")
+    
+    features_sample = []
+    for file_name in tqdm(filtered_files[:time_steps_sample], desc="Analyzing sample spectrograms"):
         file_path = os.path.join(dataset_path, file_name)
-        
         if not os.path.exists(file_path):
-            print(f"Warning: File {file_path} not found, skipping.")
             continue
         
         try:
-            # Extract features
             features = load_and_preprocess_audio(file_path)
-            features_list.append(features)
-            
-            # For simplicity, we'll just use the first element in the sequence as label
-            morse_element = labels[file_name][0] if labels[file_name] else "dot"  # Default to dot if empty
-            
-            # Convert to one-hot encoding
-            one_hot = [0] * len(MORSE_ELEMENTS)
-            try:
-                one_hot[MORSE_ELEMENTS.index(morse_element)] = 1
-                labels_list.append(one_hot)
-            except ValueError:
-                print(f"Warning: Unknown element '{morse_element}' in {file_name}, using 'dot' instead")
-                one_hot[MORSE_ELEMENTS.index("dot")] = 1
-                labels_list.append(one_hot)
-            
+            features_sample.append(features)
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
     
-    return features_list, labels_list
+    max_time_steps = find_max_time_steps(features_sample)
+    print(f"Maximum time steps across sample: {max_time_steps}")
+    
+    # Clear memory
+    del features_sample
+    gc.collect()
+    
+    # Process all files in batches
+    for batch_idx in range(0, len(filtered_files), batch_size):
+        batch_files = filtered_files[batch_idx:batch_idx + batch_size]
+        
+        features_batch = []
+        labels_batch = []
+        
+        for file_name in tqdm(batch_files, desc=f"Loading batch {batch_idx//batch_size + 1}/{(len(filtered_files)-1)//batch_size + 1}"):
+            file_path = os.path.join(dataset_path, file_name)
+            
+            if not os.path.exists(file_path):
+                print(f"Warning: File {file_path} not found, skipping.")
+                continue
+            
+            try:
+                # Extract features
+                features = load_and_preprocess_audio(file_path)
+                features_batch.append(features)
+                
+                # Get label
+                morse_element = labels[file_name][0] if labels[file_name] else "dot"
+                
+                # Convert to one-hot encoding
+                one_hot = [0] * len(MORSE_ELEMENTS)
+                try:
+                    one_hot[MORSE_ELEMENTS.index(morse_element)] = 1
+                    labels_batch.append(one_hot)
+                except ValueError:
+                    print(f"Warning: Unknown element '{morse_element}' in {file_name}, using 'dot' instead")
+                    one_hot[MORSE_ELEMENTS.index("dot")] = 1
+                    labels_batch.append(one_hot)
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+        
+        # Process and save this batch
+        process_batch_and_save(features_batch, labels_batch, batch_idx//batch_size + 1, max_time_steps, output_file)
+        
+        # Clear memory
+        del features_batch, labels_batch
+        gc.collect()
+    
+    # Print dataset info
+    with h5py.File(output_file, 'r') as f:
+        print(f"Final dataset size: {f['features'].shape}")
+    
+    return max_time_steps
 
-def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50, model_path='morse_recognition_model.h5'):
+def train_model(model, dataset_file, batch_size=32, epochs=50, model_path='morse_recognition_model.h5'):
     """
     Train model with early stopping and save a checkpoint after each epoch
+    
+    Args:
+        model: Keras model
+        dataset_file: Path to HDF5 file containing features and labels
+        batch_size: Batch size for training
+        epochs: Number of epochs for training
+        model_path: Path to save best model
     """
     # Get directory from model_path
     model_dir = os.path.dirname(model_path)
@@ -221,6 +312,40 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
     checkpoints_dir = os.path.join(model_dir, 'epoch_checkpoints')
     os.makedirs(checkpoints_dir, exist_ok=True)
     print(f"Epoch checkpoints will be saved to: {checkpoints_dir}")
+    
+    # Load dataset size info
+    with h5py.File(dataset_file, 'r') as f:
+        num_samples = f['features'].shape[0]
+    
+    # Create data generators that load from HDF5 to avoid memory issues
+    class HDF5DataGenerator(keras.utils.Sequence):
+        def __init__(self, h5_file, indices, batch_size=32):
+            self.h5_file = h5_file
+            self.indices = indices
+            self.batch_size = batch_size
+            
+        def __len__(self):
+            return (len(self.indices) + self.batch_size - 1) // self.batch_size
+        
+        def __getitem__(self, idx):
+            batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+            
+            with h5py.File(self.h5_file, 'r') as f:
+                batch_features = f['features'][batch_indices]
+                batch_labels = f['labels'][batch_indices]
+                
+            return batch_features, batch_labels
+    
+    # Split into training and validation sets
+    train_split = 0.8
+    indices = np.random.permutation(num_samples)
+    train_idx = indices[:int(train_split * num_samples)]
+    val_idx = indices[int(train_split * num_samples):]
+    
+    train_generator = HDF5DataGenerator(dataset_file, train_idx, batch_size)
+    val_generator = HDF5DataGenerator(dataset_file, val_idx, batch_size)
+    
+    print(f"Training with {len(train_idx)} samples, validating with {len(val_idx)} samples")
     
     # Define callbacks for training
     callbacks = [
@@ -258,95 +383,17 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
     
     # Train the model
     history = model.fit(
-        X_train,
-        y_train,
-        batch_size=batch_size,
+        train_generator,
+        validation_data=val_generator,
         epochs=epochs,
-        validation_data=(X_val, y_val),
         callbacks=callbacks,
-        verbose=1
+        verbose=1,
+        use_multiprocessing=True,
+        workers=4
     )
     
     print(f"Epoch checkpoints saved to: {checkpoints_dir}")
     return model, history
-
-def decode_morse_sequence(sequence):
-    """
-    Decode a sequence of Morse elements into text
-    
-    Args:
-        sequence: List of Morse elements ('dot', 'dash', 'short_pause', 'long_pause')
-        
-    Returns:
-        Decoded text and the morse code representation
-    """
-    current_char = []
-    message = []
-    morse_code = ""
-    
-    for element in sequence:
-        if element == 'dot':
-            current_char.append('.')
-            morse_code += '.'
-        elif element == 'dash':
-            current_char.append('-')
-            morse_code += '-'
-        elif element == 'short_pause' and current_char:
-            # End of character
-            morse_char = ''.join(current_char)
-            if morse_char in MORSE_TO_TEXT:
-                message.append(MORSE_TO_TEXT[morse_char])
-            current_char = []
-            morse_code += ' '
-        elif element == 'long_pause':
-            # End of word
-            if current_char:
-                morse_char = ''.join(current_char)
-                if morse_char in MORSE_TO_TEXT:
-                    message.append(MORSE_TO_TEXT[morse_char])
-                current_char = []
-            message.append(' ')
-            morse_code += ' / '
-    
-    # Handle any remaining character
-    if current_char:
-        morse_char = ''.join(current_char)
-        if morse_char in MORSE_TO_TEXT:
-            message.append(MORSE_TO_TEXT[morse_char])
-    
-    return ''.join(message).strip(), morse_code.strip()
-
-def predict_from_audio(model, audio_file, max_time_steps):
-    """
-    Predict Morse code elements from audio file and decode to text
-    
-    Args:
-        model: Trained Keras model
-        audio_file: Path to audio file
-        max_time_steps: Maximum time steps for padding
-        
-    Returns:
-        Predicted Morse element
-    """
-    # Load and preprocess audio
-    features = load_and_preprocess_audio(audio_file)
-    
-    # Standardize shape
-    freq_bins, time_steps = features.shape
-    padded_feat = np.zeros((freq_bins, max_time_steps))
-    padded_feat[:, :time_steps] = features
-    
-    # Add channel dimension for Conv2D and batch dimension
-    features_reshaped = np.expand_dims(np.expand_dims(padded_feat, axis=0), axis=-1)
-    
-    # Make prediction
-    predictions = model.predict(features_reshaped)
-    
-    # Get highest probability class
-    predicted_idx = np.argmax(predictions[0])
-    predicted_element = MORSE_ELEMENTS[predicted_idx]
-    
-    return predicted_element
 
 def plot_training_history(history):
     """
@@ -379,6 +426,30 @@ def plot_training_history(history):
     print(f"Training history plot saved to {plot_path}")
     plt.show()
 
+def predict_from_audio(model, audio_file, max_time_steps):
+    """
+    Predict Morse code elements from audio file and decode to text
+    """
+    # Load and preprocess audio
+    features = load_and_preprocess_audio(audio_file)
+    
+    # Standardize shape
+    freq_bins, time_steps = features.shape
+    padded_feat = np.zeros((freq_bins, max_time_steps))
+    padded_feat[:, :time_steps] = features
+    
+    # Add channel dimension for Conv2D and batch dimension
+    features_reshaped = np.expand_dims(np.expand_dims(padded_feat, axis=0), axis=-1)
+    
+    # Make prediction
+    predictions = model.predict(features_reshaped)
+    
+    # Get highest probability class
+    predicted_idx = np.argmax(predictions[0])
+    predicted_element = MORSE_ELEMENTS[predicted_idx]
+    
+    return predicted_element
+
 def main():
     """
     Main function to train model and make predictions
@@ -392,6 +463,7 @@ def main():
     parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model_v2.h5'), 
                        help='Path to save model')
     parser.add_argument('--test_file', help='Audio file to test after training')
+    parser.add_argument('--sample_limit', type=int, default=20000, help='Maximum samples per class (for balance)')
     
     args = parser.parse_args()
     
@@ -414,33 +486,34 @@ def main():
         print(f"Error: Labels file {args.labels} not found.")
         return
     
-    print("Loading and preprocessing dataset...")
-    features_list, labels_list = load_dataset(args.dataset, args.labels, max_samples=args.max_samples)
+    # Path for processed dataset
+    h5_dataset = os.path.join(temp_dir, 'morse_dataset.h5')
     
-    # Standardize feature shapes
-    standardized_features, max_time_steps = standardize_feature_shape(features_list)
+    # Process and save dataset
+    print("Processing dataset and saving to HDF5...")
+    max_time_steps = process_and_save_dataset(
+        args.dataset, 
+        args.labels, 
+        h5_dataset, 
+        max_samples=args.max_samples,
+        sample_limit_per_class=args.sample_limit
+    )
     
-    # Add channel dimension for Conv2D
-    X = np.array([np.expand_dims(feat, axis=-1) for feat in standardized_features])
-    y = np.array(labels_list)
-    
-    print(f"Final dataset shapes - X: {X.shape}, y: {y.shape}")
-    
-    # Split into train and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    print(f"Dataset loaded. Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
+    # Get input shape for model
+    with h5py.File(h5_dataset, 'r') as f:
+        input_shape = f['features'][0].shape
+        
+    print(f"Input shape for model: {input_shape}")
     
     # Create the model
-    input_shape = X_train[0].shape
-    print(f"Input shape for model: {input_shape}")
     model = create_model(input_shape, len(MORSE_ELEMENTS))
     model.summary()
     
     # Train the model
     print(f"Training model with batch size {args.batch_size} for {args.epochs} epochs...")
     model, history = train_model(
-        model, X_train, y_train, X_val, y_val, 
+        model, 
+        h5_dataset,
         batch_size=args.batch_size,
         epochs=args.epochs,
         model_path=args.model_path
@@ -473,5 +546,15 @@ if __name__ == "__main__":
         print(f"Current User's Login: {os.getlogin()}")
     except Exception:
         print("Could not determine current user login")
+    
+    # Set memory growth for GPU if available
+    try:
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"Memory growth enabled for {len(gpus)} GPUs")
+    except:
+        print("No GPU available or could not configure memory growth")
     
     main()
