@@ -10,6 +10,7 @@ from sklearn.model_selection import train_test_split
 import argparse
 from tqdm import tqdm
 import gc  # Garbage collection for memory management
+import datetime
 
 # Create the directory for saved models if it doesn't exist
 save_dir = r"D:\Bunny\MorseCode\backend\scipts\saved_models"
@@ -40,12 +41,13 @@ MORSE_TO_TEXT = {
     '.-.-': '+',    '-...-': '=',   '.-...': '&'
 }
 
-def load_and_preprocess_audio(file_path):
+def load_and_preprocess_audio(file_path, fixed_time_steps=None):
     """
     Load and preprocess audio file to extract mel spectrogram features
     
     Args:
         file_path: Path to the audio file
+        fixed_time_steps: Fixed number of time steps to resize to (if None, keep original)
         
     Returns:
         Mel spectrogram features
@@ -70,9 +72,41 @@ def load_and_preprocess_audio(file_path):
     
     return mel_spec_db
 
+def standardize_feature_shape(features_list):
+    """
+    Standardize the shape of all feature arrays to match the max time dimension
+    
+    Args:
+        features_list: List of features, each with shape [freq_bins, time_steps]
+        
+    Returns:
+        List of standardized features, each with shape [freq_bins, max_time_steps]
+        Max time steps value
+    """
+    # Find max time dimension across all features
+    max_time_steps = max(feat.shape[1] for feat in features_list)
+    print(f"Maximum time steps across all spectrograms: {max_time_steps}")
+    
+    # Standardize all features to have the same time dimension through padding
+    standardized_features = []
+    
+    for feat in tqdm(features_list, desc="Padding spectrograms"):
+        # Current shape and dimensions
+        freq_bins, time_steps = feat.shape
+        
+        # Create padded array
+        padded_feat = np.zeros((freq_bins, max_time_steps))
+        
+        # Copy original data
+        padded_feat[:, :time_steps] = feat
+        
+        standardized_features.append(padded_feat)
+    
+    return standardized_features, max_time_steps
+
 def create_model(input_shape, num_classes=4):
     """
-    Create a CNN+LSTM model for audio classification
+    Create a CNN model for audio classification
     
     Args:
         input_shape: Shape of input features (mel spectrogram)
@@ -82,9 +116,9 @@ def create_model(input_shape, num_classes=4):
         Compiled Keras model
     """
     # Input layer
-    inputs = keras.Input(shape=input_shape)
+    inputs = keras.Input(shape=input_shape, name="input_layer")
     
-    # Convolutional layers to extract features
+    # Convolutional layers
     x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.BatchNormalization()(x)
@@ -94,16 +128,11 @@ def create_model(input_shape, num_classes=4):
     x = layers.BatchNormalization()(x)
     
     x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-    x = layers.MaxPooling2D((2, 2))(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.GlobalAveragePooling2D()(x)
     
-    # Reshape for LSTM
-    x = layers.Reshape((-1, x.shape[-1]))(x)
-    
-    # LSTM layers for sequential information
-    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Bidirectional(layers.LSTM(64))(x)
+    # Dense layers
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
     
     # Output layer
     outputs = layers.Dense(num_classes, activation='softmax')(x)
@@ -118,7 +147,7 @@ def create_model(input_shape, num_classes=4):
     
     return model
 
-def load_dataset(dataset_path, label_file, max_samples=None, batch_processing=False):
+def load_dataset(dataset_path, label_file, max_samples=None):
     """
     Load dataset from directory
     
@@ -126,11 +155,10 @@ def load_dataset(dataset_path, label_file, max_samples=None, batch_processing=Fa
         dataset_path: Path to directory containing audio files
         label_file: Path to JSON file containing labels
         max_samples: Maximum number of samples to load (useful for testing)
-        batch_processing: Whether to process in batches to save memory
         
     Returns:
-        X: Features
-        y: Labels
+        features_list: List of audio features
+        labels_list: List of one-hot encoded labels
     """
     # Load labels from JSON file
     print(f"Loading labels from {label_file}")
@@ -147,69 +175,39 @@ def load_dataset(dataset_path, label_file, max_samples=None, batch_processing=Fa
     total_files = len(file_names)
     print(f"Found {total_files} labeled files")
     
-    if batch_processing:
-        # Return a generator to process files in batches
-        def dataset_generator():
-            for file_name in tqdm(file_names, desc="Processing audio files"):
-                file_path = os.path.join(dataset_path, file_name)
-                if not os.path.exists(file_path):
-                    continue
-                
-                try:
-                    # Extract features
-                    features = load_and_preprocess_audio(file_path)
-                    
-                    # Convert labels to one-hot encoding
-                    morse_elements = labels[file_name]
-                    label_seq = []
-                    for element in morse_elements:
-                        one_hot = [0] * len(MORSE_ELEMENTS)
-                        try:
-                            one_hot[MORSE_ELEMENTS.index(element)] = 1
-                            label_seq.append(one_hot)
-                        except ValueError:
-                            print(f"Warning: Unknown element '{element}' in {file_name}, skipping")
-                    
-                    yield features, np.array(label_seq)
-                    
-                except Exception as e:
-                    print(f"Error processing {file_path}: {e}")
+    # Process all files
+    features_list = []
+    labels_list = []
+    
+    for file_name in tqdm(file_names, desc="Processing audio files"):
+        file_path = os.path.join(dataset_path, file_name)
         
-        return dataset_generator, total_files
-    else:
-        # Process all files at once
-        X = []
-        y = []
+        if not os.path.exists(file_path):
+            print(f"Warning: File {file_path} not found, skipping.")
+            continue
         
-        for file_name in tqdm(file_names, desc="Processing audio files"):
-            file_path = os.path.join(dataset_path, file_name)
+        try:
+            # Extract features
+            features = load_and_preprocess_audio(file_path)
+            features_list.append(features)
             
-            if not os.path.exists(file_path):
-                print(f"Warning: File {file_path} not found, skipping.")
-                continue
+            # For simplicity, we'll just use the first element in the sequence as label
+            morse_element = labels[file_name][0] if labels[file_name] else "dot"  # Default to dot if empty
             
+            # Convert to one-hot encoding
+            one_hot = [0] * len(MORSE_ELEMENTS)
             try:
-                # Extract features
-                features = load_and_preprocess_audio(file_path)
-                X.append(features)
-                
-                # Convert labels to one-hot encoding
-                morse_elements = labels[file_name]
-                label_seq = []
-                for element in morse_elements:
-                    one_hot = [0] * len(MORSE_ELEMENTS)
-                    try:
-                        one_hot[MORSE_ELEMENTS.index(element)] = 1
-                        label_seq.append(one_hot)
-                    except ValueError:
-                        print(f"Warning: Unknown element '{element}' in {file_name}, skipping")
-                
-                y.append(label_seq)
-                
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
-        
-        return np.array(X), np.array(y)
+                one_hot[MORSE_ELEMENTS.index(morse_element)] = 1
+                labels_list.append(one_hot)
+            except ValueError:
+                print(f"Warning: Unknown element '{morse_element}' in {file_name}, using 'dot' instead")
+                one_hot[MORSE_ELEMENTS.index("dot")] = 1
+                labels_list.append(one_hot)
+            
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+    
+    return features_list, labels_list
 
 def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50, model_path='morse_recognition_model.h5'):
     """
@@ -217,7 +215,7 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
     """
     # Get directory from model_path
     model_dir = os.path.dirname(model_path)
-    latest_model_path = os.path.join(model_dir, 'morse_model_latest.h5')
+    latest_model_path = os.path.join(model_dir, 'latest_model_v2.h5')
     
     # Define callbacks for training
     callbacks = [
@@ -305,36 +303,37 @@ def decode_morse_sequence(sequence):
     
     return ''.join(message).strip(), morse_code.strip()
 
-def predict_from_audio(model, audio_file):
+def predict_from_audio(model, audio_file, max_time_steps):
     """
     Predict Morse code elements from audio file and decode to text
     
     Args:
         model: Trained Keras model
         audio_file: Path to audio file
+        max_time_steps: Maximum time steps for padding
         
     Returns:
-        Predicted text
+        Predicted Morse element
     """
     # Load and preprocess audio
     features = load_and_preprocess_audio(audio_file)
     
-    # Reshape for model input (add batch dimension)
-    features = np.expand_dims(features, axis=0)
+    # Standardize shape
+    freq_bins, time_steps = features.shape
+    padded_feat = np.zeros((freq_bins, max_time_steps))
+    padded_feat[:, :time_steps] = features
+    
+    # Add channel dimension for Conv2D and batch dimension
+    features_reshaped = np.expand_dims(np.expand_dims(padded_feat, axis=0), axis=-1)
     
     # Make prediction
-    predictions = model.predict(features)
+    predictions = model.predict(features_reshaped)
     
-    # Get highest probability class for each time step
-    predicted_classes = np.argmax(predictions, axis=-1)
+    # Get highest probability class
+    predicted_idx = np.argmax(predictions[0])
+    predicted_element = MORSE_ELEMENTS[predicted_idx]
     
-    # Convert class indices to Morse elements
-    morse_sequence = [MORSE_ELEMENTS[idx] for idx in predicted_classes[0]]
-    
-    # Decode Morse sequence to text
-    decoded_text, morse_code = decode_morse_sequence(morse_sequence)
-    
-    return decoded_text, morse_code
+    return predicted_element
 
 def plot_training_history(history):
     """
@@ -361,7 +360,7 @@ def plot_training_history(history):
     # Save the plot to the same directory as the model
     plots_dir = save_dir
     os.makedirs(plots_dir, exist_ok=True)
-    plot_path = os.path.join(plots_dir, 'training_history.png')
+    plot_path = os.path.join(plots_dir, 'training_history_v2.png')
     plt.tight_layout()
     plt.savefig(plot_path)
     print(f"Training history plot saved to {plot_path}")
@@ -377,7 +376,7 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum number of samples to load')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs for training')
-    parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model.h5'), 
+    parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model_v2.h5'), 
                        help='Path to save model')
     parser.add_argument('--test_file', help='Audio file to test after training')
     
@@ -390,6 +389,7 @@ def main():
     print(f"Using dataset: {args.dataset}")
     print(f"Using labels: {args.labels}")
     print(f"Model will be saved to: {args.model_path}")
+    print(f"Latest model will be saved as: {os.path.join(save_dir, 'latest_model_v2.h5')}")
     
     # Check if dataset and labels exist
     if not os.path.exists(args.dataset):
@@ -401,7 +401,16 @@ def main():
         return
     
     print("Loading and preprocessing dataset...")
-    X, y = load_dataset(args.dataset, args.labels, max_samples=args.max_samples)
+    features_list, labels_list = load_dataset(args.dataset, args.labels, max_samples=args.max_samples)
+    
+    # Standardize feature shapes
+    standardized_features, max_time_steps = standardize_feature_shape(features_list)
+    
+    # Add channel dimension for Conv2D
+    X = np.array([np.expand_dims(feat, axis=-1) for feat in standardized_features])
+    y = np.array(labels_list)
+    
+    print(f"Final dataset shapes - X: {X.shape}, y: {y.shape}")
     
     # Split into train and validation sets
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -410,6 +419,7 @@ def main():
     
     # Create the model
     input_shape = X_train[0].shape
+    print(f"Input shape for model: {input_shape}")
     model = create_model(input_shape, len(MORSE_ELEMENTS))
     model.summary()
     
@@ -425,9 +435,10 @@ def main():
     # Plot training history
     plot_training_history(history)
     
-    # Save the model
-    model.save(args.model_path)
-    print(f"Model saved as '{args.model_path}'")
+    # Save the final model as latest_model_v2.h5
+    final_model_path = os.path.join(save_dir, 'latest_model_v2.h5')
+    model.save(final_model_path)
+    print(f"Final model saved as '{final_model_path}'")
     
     # Example prediction
     test_file = args.test_file
@@ -435,10 +446,11 @@ def main():
         test_file = input("Enter path to a Morse code audio file to test (or press Enter to skip): ")
     
     if test_file and os.path.exists(test_file):
-        decoded_text, morse_code = predict_from_audio(model, test_file)
+        predicted_element = predict_from_audio(model, test_file, max_time_steps)
         print("\nResults:")
-        print(f"Decoded Morse code: {morse_code}")
-        print(f"Decoded text: {decoded_text}")
+        print(f"Predicted Morse element: {predicted_element}")
+        print("Note: This simplified model only predicts the dominant element in the audio.")
+        print("For more complete Morse code processing, window-based analysis would be needed.")
 
 if __name__ == "__main__":
     # Print current user and time information
