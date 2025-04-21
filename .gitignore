@@ -22,4 +22,6 @@ backend/data/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.wav
+*.mp3
 backend/scipts/morse_audio_dataset/

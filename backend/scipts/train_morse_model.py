@@ -11,6 +11,10 @@ import argparse
 from tqdm import tqdm
 import gc  # Garbage collection for memory management
 
+# Create the directory for saved models if it doesn't exist
+save_dir = r"D:\Bunny\MorseCode\backend\scipts\saved_models"
+os.makedirs(save_dir, exist_ok=True)
+
 # Constants
 SAMPLE_RATE = 22050
 DURATION = 30  # max duration in seconds to analyze
@@ -211,6 +215,10 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
     """
     Train model with early stopping
     """
+    # Get directory from model_path
+    model_dir = os.path.dirname(model_path)
+    latest_model_path = os.path.join(model_dir, 'morse_model_latest.h5')
+    
     # Define callbacks for training
     callbacks = [
         keras.callbacks.EarlyStopping(
@@ -232,7 +240,7 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
         ),
         # Save model after each epoch to prevent data loss
         keras.callbacks.ModelCheckpoint(
-            'morse_model_latest.h5',
+            latest_model_path,
             save_best_only=False,
             verbose=0
         )
@@ -350,8 +358,13 @@ def plot_training_history(history):
     plt.xlabel('Epoch')
     plt.legend(['Train', 'Validation'], loc='upper left')
     
+    # Save the plot to the same directory as the model
+    plots_dir = save_dir
+    os.makedirs(plots_dir, exist_ok=True)
+    plot_path = os.path.join(plots_dir, 'training_history.png')
     plt.tight_layout()
-    plt.savefig('training_history.png')
+    plt.savefig(plot_path)
+    print(f"Training history plot saved to {plot_path}")
     plt.show()
 
 def main():
@@ -364,7 +377,8 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum number of samples to load')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs for training')
-    parser.add_argument('--model_path', default='morse_recognition_model.h5', help='Path to save model')
+    parser.add_argument('--model_path', default=os.path.join(save_dir, 'morse_recognition_model.h5'), 
+                       help='Path to save model')
     parser.add_argument('--test_file', help='Audio file to test after training')
     
     args = parser.parse_args()
@@ -375,6 +389,7 @@ def main():
     
     print(f"Using dataset: {args.dataset}")
     print(f"Using labels: {args.labels}")
+    print(f"Model will be saved to: {args.model_path}")
     
     # Check if dataset and labels exist
     if not os.path.exists(args.dataset):
@@ -426,4 +441,11 @@ def main():
         print(f"Decoded text: {decoded_text}")
 
 if __name__ == "__main__":
+    # Print current user and time information
+    print(f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+    try:
+        print(f"Current User's Login: {os.getlogin()}")
+    except Exception:
+        print("Could not determine current user login")
+    
     main()
