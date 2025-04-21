@@ -1,1 +1,3 @@
 morse_audio_to_text.py for audio to text
+morse_decoder.py predect
+morse_code_converter.py words to morese
