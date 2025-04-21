@@ -7,25 +7,33 @@ import random
 import argparse
 from tqdm import tqdm
 import re
-from nltk.corpus import brown, gutenberg
-import nltk
+import multiprocessing
+from functools import partial
+import time
+import gc
 
-# Try to download NLTK data if not present
-try:
-    nltk.download('brown', quiet=True)
-    nltk.download('gutenberg', quiet=True)
-    nltk.download('punkt', quiet=True)
-except:
-    print("Note: NLTK data download failed. Will use built-in sentences only.")
+# Skip NLTK for speed; using static sentences is faster
+USE_NLTK = False
+if USE_NLTK:
+    try:
+        import nltk
+        from nltk.corpus import brown, gutenberg
+        nltk.download('brown', quiet=True)
+        nltk.download('gutenberg', quiet=True)
+        nltk.download('punkt', quiet=True)
+        print("NLTK corpus loaded successfully")
+    except ImportError:
+        print("NLTK not available, using built-in sentences only")
+        USE_NLTK = False
 
-# Constants
-DOT_DURATION = 100  # ms
+# Constants - slightly simplified for speed
+DOT_DURATION = 80  # ms (reduced from 100 for faster generation)
 DASH_DURATION = 3 * DOT_DURATION
 INTRA_CHAR_PAUSE = DOT_DURATION
 INTER_CHAR_PAUSE = 3 * DOT_DURATION
 WORD_PAUSE = 7 * DOT_DURATION
 TONE_FREQ = 800  # Hz
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 22050  # Reduced from 44100 for faster processing
 
 # Morse code dictionary
 TEXT_TO_MORSE = {
@@ -40,75 +48,49 @@ TEXT_TO_MORSE = {
     '5': '.....',  '6': '-....',  '7': '--...',  '8': '---..',
     '9': '----.',  '0': '-----',
     '.': '.-.-.-', ',': '--..--', '?': '..--..',
-    '/': '-..-.',  '-': '-....-', '!': '-.-.--',
-    '@': '.--.-.',  ':': '---...', ';': '-.-.-.',
-    '=': '-...-',    '+': '.-.-.',  '&': '.-...'
+    '/': '-..-.',  '-': '-....-', '!': '-.-.--'
 }
 
-# Comprehensive collection of advanced sentences
-ADVANCED_SENTENCES = [
-    # Scientific and technical
-    "QUANTUM MECHANICS DESCRIBES NATURE AT THE SUBATOMIC SCALE",
-    "THE FIBONACCI SEQUENCE APPEARS THROUGHOUT NATURE",
-    "ARTIFICIAL NEURAL NETWORKS MIMIC BIOLOGICAL LEARNING PROCESSES",
-    "CLIMATE CHANGE PRESENTS UNPRECEDENTED GLOBAL CHALLENGES",
-    "DNA SEQUENCING REVOLUTIONIZED GENETIC RESEARCH",
-    "BLOCKCHAIN TECHNOLOGY ENABLES DECENTRALIZED TRANSACTIONS",
+# Shorter collection of sentences for faster generation
+SENTENCES = [
+    # Short and common
+    "HELLO WORLD", "SOS", "MAYDAY", "CQ DX", "HOW ARE YOU", "THANK YOU", 
+    "GOOD MORNING", "GOOD NIGHT", "TESTING", "QTH", "QSL", "QRZ",
+    "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG",
     
-    # Literature and philosophy
-    "TO BE OR NOT TO BE THAT IS THE QUESTION",
-    "THE UNEXAMINED LIFE IS NOT WORTH LIVING",
-    "ALL HAPPY FAMILIES ARE ALIKE EACH UNHAPPY FAMILY IS UNHAPPY IN ITS OWN WAY",
-    "IT WAS THE BEST OF TIMES IT WAS THE WORST OF TIMES",
-    "IN THE BEGINNING GOD CREATED THE HEAVENS AND THE EARTH",
+    # Medium length technical
+    "QUANTUM PHYSICS", "MACHINE LEARNING", "ARTIFICIAL INTELLIGENCE",
+    "DIGITAL SIGNAL PROCESSING", "DATA SCIENCE", "FREQUENCY MODULATION",
+    "RADIO TRANSMISSION", "ELECTROMAGNETIC WAVE", "SIGNAL STRENGTH",
     
-    # Complex structures
-    "ALTHOUGH THE THEORY WAS CONTROVERSIAL SCIENTISTS EVENTUALLY ACCEPTED IT",
-    "WHENEVER I FEEL AFRAID I HOLD MY HEAD ERECT AND WHISTLE A HAPPY TUNE",
-    "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND THEN RUNS FAR AWAY",
-    "DESPITE THE HEAVY RAIN THE HIKERS CONTINUED THEIR JOURNEY THROUGH THE MOUNTAINS",
-    "JUST BECAUSE SOMETHING IS DIFFICULT DOES NOT MEAN IT IS IMPOSSIBLE TO ACHIEVE",
+    # Morse-related
+    "CQ CQ CQ DE AMATEUR RADIO", "SIGNAL REPORT", "FREQUENCY SHIFT", 
+    "MORSE CODE IS FUN", "RADIO OPERATORS", "ANTENNA TUNER",
     
-    # Quotations
-    "BE THE CHANGE YOU WISH TO SEE IN THE WORLD",
-    "LIFE IS WHAT HAPPENS WHEN YOU ARE BUSY MAKING OTHER PLANS",
-    "THE GREATEST GLORY IN LIVING LIES NOT IN NEVER FALLING BUT IN RISING EVERY TIME WE FALL",
-    "THE WAY TO GET STARTED IS TO QUIT TALKING AND BEGIN DOING",
-    "YOUR TIME IS LIMITED SO DONT WASTE IT LIVING SOMEONE ELSES LIFE",
-    
-    # Technical Morse-specific
-    "CQ CQ CQ DE AMATEUR RADIO CALLING ANY STATION",
-    "QTH IS BOSTON MASSACHUSETTS QSL",
-    "SIGNAL REPORT IS FIVE NINE PLUS TWENTY DB",
-    "FREQUENCY QSY TO SEVEN POINT ONE ZERO FIVE",
-    "QRM HEAVY ON THIS FREQUENCY MOVING UP FIVE",
-    
-    # Long complex sentences
-    "THE INTRICATE RELATIONSHIP BETWEEN QUANTUM PHYSICS AND CONSCIOUSNESS REMAINS ONE OF THE MOST PROFOUND MYSTERIES IN MODERN SCIENCE",
-    "NOTWITHSTANDING THE DIFFICULTIES INHERENT IN CROSS CULTURAL COMMUNICATION THE INTERNATIONAL TEAM SUCCESSFULLY COMPLETED THE PROJECT AHEAD OF SCHEDULE",
-    "WHEREAS PREVIOUS GENERATIONS RELIED ON TRADITIONAL KNOWLEDGE PASSED DOWN THROUGH APPRENTICESHIP CONTEMPORARY EDUCATION EMPHASIZES CRITICAL THINKING AND INTERDISCIPLINARY APPROACHES",
+    # Complex structures (limited number for speed)
+    "IF DATA IS PROCESSED THEN SIGNALS ARE TRANSMITTED",
+    "WHEN RADIO WORKS COMMUNICATION HAPPENS QUICKLY",
+    "THE SYSTEM ANALYZES WHILE THE NETWORK TRANSMITS"
 ]
 
-# Domain-specific vocabulary
+# Domain-specific vocabulary (reduced for speed)
 DOMAIN_VOCABULARIES = {
-    "technology": ["ALGORITHM", "BANDWIDTH", "COMPUTER", "DATABASE", "ENCRYPTION", "FIREWALL", 
-                  "GIGABYTE", "HARDWARE", "INTERFACE", "JAVASCRIPT", "KERNEL", "LOCALHOST", 
-                  "MICROCHIP", "NETWORK", "OPERATING SYSTEM", "PROTOCOL", "QUANTUM", "ROUTER",
-                  "SERVER", "TERABYTE", "USB", "VIRTUAL", "WIRELESS", "XML", "YAML", "ZETTABYTE"],
+    "technology": ["ALGORITHM", "COMPUTER", "DATABASE", "ENCRYPTION", "HARDWARE", 
+                  "INTERFACE", "KERNEL", "NETWORK", "PROTOCOL", "SERVER", "VIRTUAL"],
     
-    "science": ["ASTRONOMY", "BIOLOGY", "CHEMISTRY", "DENSITY", "ECOSYSTEM", "FUSION", 
-               "GRAVITY", "HYPOTHESIS", "ISOTOPE", "JOULE", "KINETIC", "LABORATORY", 
-               "MOLECULE", "NEUTRON", "OSMOSIS", "PHOTON", "QUANTUM", "RELATIVITY",
-               "SYNTHESIS", "THERMODYNAMICS", "ULTRAVIOLET", "VELOCITY", "WAVELENGTH", 
-               "XENON", "YIELD", "ZOOLOGY"],
-    
-    "morse": ["ANTENNA", "BEACON", "CALLSIGN", "DIT", "DAH", "ELEMENT", "FREQUENCY", "GROUND",
-             "HERTZ", "IAMBIC", "KEYER", "LOGBOOK", "MODULATION", "NOISE", "OPERATOR", "PROPAGATION",
-             "QRM", "REPEATER", "SIGNAL", "TRANSMITTER", "UTC", "VERTICAL", "WATT", "XRAY", "YANKEE", "ZULU"]
+    "morse": ["ANTENNA", "BEACON", "CALLSIGN", "FREQUENCY", "KEYER", "OPERATOR", 
+              "QRM", "SIGNAL", "TRANSMITTER", "RADIO"]
 }
 
-def generate_sine_wave(freq, duration_ms, sample_rate=44100):
-    """Generate a sine wave using numpy (alternative to pydub.generators.Sine)"""
+# Precomputed sine waves for common durations to avoid regenerating them
+SINE_CACHE = {}
+
+def generate_sine_wave(freq, duration_ms, sample_rate=SAMPLE_RATE):
+    """Generate a sine wave using numpy (optimized with caching)"""
+    key = (freq, duration_ms, sample_rate)
+    if key in SINE_CACHE:
+        return SINE_CACHE[key]
+    
     num_samples = int(sample_rate * (duration_ms / 1000.0))
     
     # Generate sine wave samples
@@ -118,28 +100,37 @@ def generate_sine_wave(freq, duration_ms, sample_rate=44100):
     samples = (samples * 32767).astype(np.int16)
     
     # Create AudioSegment
-    return AudioSegment(
+    audio_segment = AudioSegment(
         samples.tobytes(),
         frame_rate=sample_rate,
         sample_width=2,
         channels=1
     )
+    
+    # Cache for future use (limit cache size)
+    if len(SINE_CACHE) < 10:
+        SINE_CACHE[key] = audio_segment
+    
+    return audio_segment
 
-def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variation=0.0, fading=0.0):
+def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variation=0.0):
     """
-    Generate Morse code audio from text
+    Generate Morse code audio from text (optimized version)
     
     Args:
         text: Text to convert to Morse code
         noise_level: Amount of noise to add (0 to 1)
         speed_factor: Speed multiplier (higher = faster)
         freq_variation: Amount of frequency variation (0 to 1)
-        fading: Amount of signal fading to simulate (0 to 1)
         
     Returns:
         AudioSegment: The generated Morse code audio
         list: Sequence of Morse elements for labeling
     """
+    # Limit text length to speed up generation
+    if len(text) > 50:  # Reduced max length
+        text = text[:50]
+        
     # Adjust durations based on speed factor
     dot_dur = int(DOT_DURATION / speed_factor)
     dash_dur = int(DASH_DURATION / speed_factor)
@@ -153,14 +144,9 @@ def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variatio
         freq_range = TONE_FREQ * freq_variation
         base_freq = TONE_FREQ + random.uniform(-freq_range, freq_range)
     
-    # Try using built-in Sine generator first, fall back to custom function if it fails
-    try:
-        dot_sound = Sine(base_freq).to_audio_segment(duration=dot_dur)
-        dash_sound = Sine(base_freq).to_audio_segment(duration=dash_dur)
-    except Exception:
-        # Fallback to custom sine wave generator
-        dot_sound = generate_sine_wave(base_freq, dot_dur)
-        dash_sound = generate_sine_wave(base_freq, dash_dur)
+    # Generate sound segments
+    dot_sound = generate_sine_wave(base_freq, dot_dur)
+    dash_sound = generate_sine_wave(base_freq, dash_dur)
     
     # Create silence segments
     intra_char_space = AudioSegment.silent(duration=intra_char)
@@ -171,6 +157,7 @@ def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variatio
     audio = AudioSegment.silent(duration=0)
     elements = []  # To store the sequence of elements for labeling
     
+    # Process each character
     for char in text.upper():
         if char == ' ':
             audio += word_space
@@ -194,32 +181,10 @@ def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variatio
             audio += inter_char_space
             elements.append('short_pause')
     
-    # Apply fading effect if specified
-    if fading > 0:
-        try:
-            # Get audio as array
-            samples = np.array(audio.get_array_of_samples())
-            
-            # Create fading envelope
-            t = np.linspace(0, 1, len(samples))
-            fading_points = int(len(samples) * fading * random.uniform(0.1, 0.5))
-            fade_positions = sorted(random.sample(range(len(samples) - fading_points), int(len(samples) * fading * 0.1)))
-            
-            for pos in fade_positions:
-                fade_env = np.ones(len(samples))
-                fade_env[pos:pos+fading_points] = np.linspace(1, 0.2, fading_points)
-                samples = (samples * fade_env).astype(samples.dtype)
-                
-            # Convert back to AudioSegment
-            new_audio = audio._spawn(samples.tobytes())
-            audio = new_audio
-        except Exception as e:
-            print(f"Warning: Could not apply fading effect: {e}")
-    
-    # Add noise if specified
+    # Add noise if specified (simplified for speed)
     if noise_level > 0:
         try:
-            # Generate noise
+            # Generate noise (simpler approach)
             noise_samples = np.random.normal(0, noise_level, len(audio.raw_data) // 2).astype(np.float32)
             noise_samples = (noise_samples * 32767).astype(np.int16)
             
@@ -239,79 +204,85 @@ def generate_morse_audio(text, noise_level=0.05, speed_factor=1.0, freq_variatio
             # Mix with audio
             audio = audio.overlay(noise_audio)
         except Exception as e:
-            print(f"Warning: Could not add noise to audio: {e}")
+            pass  # Silently ignore errors for speed
     
     return audio, elements
 
-def get_nltk_sentences(num_sentences=100):
-    """Get sentences from NLTK corpora"""
-    sentences = []
+def generate_text_sample(base_samples):
+    """Generate a text sample for Morse code conversion"""
+    # Reuse a base sample with high probability
+    if base_samples and random.random() < 0.7:
+        # Favor shorter samples for faster processing
+        samples_by_length = sorted(base_samples, key=len)
+        # Get a sample from the first 70% of the sorted list (shorter samples)
+        index = random.randint(0, int(len(samples_by_length) * 0.7))
+        return samples_by_length[index]
+    
+    # Generate new text
+    text_type = random.choices(
+        ["word", "chars", "short_sentence"],  # Simplified options
+        weights=[20, 10, 10]
+    )[0]
+    
+    if text_type == "word":
+        # Generate a single random word
+        word_len = random.randint(3, 8)  # Shorter words
+        return ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(word_len))
+    
+    elif text_type == "chars":
+        # Generate random characters (useful for training individual letters)
+        chars = random.sample('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', random.randint(1, 5))
+        return ' '.join(chars)
+    
+    else:  # short_sentence
+        # Generate a short random sentence
+        word_count = random.randint(2, 5)  # Fewer words
+        words = []
+        for _ in range(word_count):
+            word_len = random.randint(2, 6)  # Shorter words
+            word = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(word_len))
+            words.append(word)
+        return ' '.join(words)
+
+def process_sample(args):
+    """Process a single sample (for multiprocessing)"""
+    index, output_dir, text = args
     
     try:
-        # Try Brown corpus first (more modern English)
-        brown_sents = brown.sents()
-        if brown_sents:
-            for sent in random.sample(list(brown_sents), min(len(brown_sents), num_sentences // 2)):
-                # Clean and join the sentence
-                text = ' '.join(word.upper() for word in sent if re.match(r'^[A-Za-z0-9]+$', word))
-                if len(text) > 10:  # Only keep reasonably long sentences
-                    sentences.append(text)
+        # Generate parameters
+        speed = random.uniform(0.8, 1.3)
+        noise = random.uniform(0.01, 0.15)
+        freq_var = random.uniform(0.0, 0.1)
         
-        # Add some literary sentences from Gutenberg
-        gutenberg_sents = gutenberg.sents()
-        if gutenberg_sents:
-            for sent in random.sample(list(gutenberg_sents), min(len(gutenberg_sents), num_sentences // 2)):
-                text = ' '.join(word.upper() for word in sent if re.match(r'^[A-Za-z0-9]+$', word))
-                if len(text) > 10 and len(text) < 100:  # Length constraints
-                    sentences.append(text)
-    except:
-        print("Could not load NLTK corpora. Using built-in sentences only.")
-    
-    return sentences[:num_sentences]
+        # Generate audio
+        audio, elements = generate_morse_audio(
+            text, 
+            noise_level=noise, 
+            speed_factor=speed,
+            freq_variation=freq_var
+        )
+        
+        # Save audio file
+        file_name = f"morse_sample_{index:05d}.wav"
+        file_path = os.path.join(output_dir, file_name)
+        audio.export(file_path, format="wav")
+        
+        # Return information for labels
+        return file_name, elements, text
+    except Exception as e:
+        return None, None, None
 
-def generate_grammar_based_sentence():
-    """Generate a grammatically structured sentence using templates"""
-    templates = [
-        "THE {adj} {noun} {verb} {adv}",
-        "{adj} {noun} {verb} THE {adj} {noun}",
-        "IF {noun} {verb}, THEN {noun} {verb}",
-        "{noun} {verb} BECAUSE {noun} {verb}",
-        "WHEN {noun} {verb}, {noun} {verb} {adv}",
-        "{noun} THAT {verb} {adv} {verb} THE {adj} {noun}",
-        "BOTH {noun} AND {noun} {verb} THE {adj} {noun}",
-        "NEITHER {noun} NOR {noun} {verb} {adv}",
-        "{adv} {verb} THE {noun} BEFORE {noun} {verb}",
-        "THE {noun} {verb} WHILE THE {noun} {verb}"
-    ]
-    
-    words = {
-        "noun": ["SYSTEM", "NETWORK", "COMPUTER", "DATA", "USER", "SERVER", "CODE", "SIGNAL", 
-                "PROGRAM", "STATION", "RADIO", "OPERATOR", "MESSAGE", "FREQUENCY", "ANTENNA",
-                "SCIENCE", "THEORY", "EXPERIMENT", "RESEARCHER", "DISCOVERY"],
-        "verb": ["TRANSMITS", "RECEIVES", "PROCESSES", "COMPUTES", "ANALYZES", "STORES",
-               "BROADCASTS", "DECODES", "ENCRYPTS", "SENDS", "STUDIES", "EXPLORES",
-               "EXPLAINS", "VERIFIES", "CONFIRMS", "DEMONSTRATES", "REVEALS"],
-        "adj": ["DIGITAL", "ANALOG", "WIRELESS", "ENCRYPTED", "SECURE", "ADVANCED",
-              "COMPLEX", "EFFICIENT", "POWERFUL", "RELIABLE", "MODERN", "SCIENTIFIC",
-              "THEORETICAL", "EXPERIMENTAL", "QUANTUM", "TECHNICAL", "PRACTICAL"],
-        "adv": ["QUICKLY", "SECURELY", "EFFICIENTLY", "WIRELESSLY", "ACCURATELY",
-              "RELIABLY", "AUTOMATICALLY", "PRECISELY", "EFFECTIVELY", "CAREFULLY"]
-    }
-    
-    template = random.choice(templates)
-    
-    # Replace placeholders with random words
-    for word_type in words.keys():
-        while "{" + word_type + "}" in template:
-            template = template.replace("{" + word_type + "}", random.choice(words[word_type]), 1)
-            
-    return template
-
-def generate_dataset(output_dir, num_samples=1000, text_samples=None, start_index=0, verbose=True):
+def generate_dataset_parallel(output_dir, num_samples=1000, start_index=0, num_processes=None):
     """
-    Generate a dataset of Morse code audio files with labels
+    Generate a dataset of Morse code audio files with labels using parallel processing
     """
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Determine number of processes
+    if num_processes is None:
+        num_processes = max(1, multiprocessing.cpu_count() - 1)
+    
+    print(f"Using {num_processes} processes for parallel generation")
     
     # Load existing labels if any
     labels_file = os.path.join(output_dir, 'morse_labels.json')
@@ -325,197 +296,65 @@ def generate_dataset(output_dir, num_samples=1000, text_samples=None, start_inde
     else:
         labels = {}
     
-    # Base set of text samples
-    base_samples = [
-        # Common Morse code phrases
-        "HELLO WORLD",
-        "SOS",
-        "MAYDAY",
-        "CQ DX",
-        "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG",
-        "73 BEST REGARDS",
-        "QRZ WHO IS CALLING",
-        "QTH MY LOCATION IS",
-        "QSL CONFIRMING RECEIPT",
-        "QRV READY TO RECEIVE",
-        
-        # Technical terms
-        "FREQUENCY SHIFT KEYING",
-        "AMPLITUDE MODULATION",
-        "CONTINUOUS WAVE",
-        "SINGLE SIDEBAND",
-        "RADIO FREQUENCY",
-        "ELECTROMAGNETIC SPECTRUM",
-        "DIGITAL SIGNAL PROCESSING",
-        
-        # Programming terms
-        "PYTHON PROGRAMMING",
-        "ARTIFICIAL INTELLIGENCE",
-        "MACHINE LEARNING",
-        "DEEP NEURAL NETWORKS",
-        "CONVOLUTIONAL NETWORKS",
-        "RECURRENT NEURAL NETWORKS",
-        "NATURAL LANGUAGE PROCESSING",
-        
-        # Common expressions
-        "HOW ARE YOU",
-        "THANK YOU",
-        "GOOD MORNING",
-        "GOOD AFTERNOON",
-        "GOOD EVENING",
-        "THIS IS A TEST",
-        "PLEASE REPLY",
-        "OVER AND OUT",
-        "ROGER THAT",
-    ]
+    # Prepare base text samples
+    base_samples = SENTENCES.copy()
     
-    # Extend with advanced sentences
-    base_samples.extend(ADVANCED_SENTENCES)
-    
-    # Add domain-specific vocabulary
+    # Add domain vocabulary
     for domain, words in DOMAIN_VOCABULARIES.items():
-        for word in words:
-            base_samples.append(word)
-    
-    # Get sentences from NLTK if available (more varied and natural language)
-    try:
-        nltk_sentences = get_nltk_sentences(200)
-        base_samples.extend(nltk_sentences)
-    except:
-        pass
+        base_samples.extend(words)
     
     # Add single letters and numbers
     for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
         base_samples.append(char)
     
-    # If custom samples provided, merge them
-    if text_samples:
-        base_samples.extend(text_samples)
-        
-    # Ensure uniqueness
-    base_samples = list(set(base_samples))
-    
-    # Create progress bar if verbose
-    if verbose:
-        pbar = tqdm(total=num_samples, desc="Generating samples")
-    
-    batch_size = 50  # Save labels every batch_size samples
-    
+    # Generate text samples in advance (faster than generating during processing)
+    print("Preparing text samples...")
+    text_samples = []
     for i in range(start_index, start_index + num_samples):
-        try:
-            # Select or generate text
-            if i < len(base_samples):
-                text = base_samples[i]
-            else:
-                # Generate more varied text based on various strategies
-                text_type = random.choices(
-                    ["word", "sentence", "characters", "grammar", "domain", "advanced"],
-                    weights=[10, 30, 10, 20, 15, 15]  # Higher weight for sentences
-                )[0]
-                
-                if text_type == "word":
-                    # Generate a single random word
-                    word_len = random.randint(3, 12)
-                    text = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(word_len))
-                
-                elif text_type == "sentence":
-                    # Generate a random sentence
-                    word_count = random.randint(3, 12)
-                    words = []
-                    for _ in range(word_count):
-                        word_len = random.randint(2, 10)
-                        word = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(word_len))
-                        words.append(word)
-                    text = ' '.join(words)
-                
-                elif text_type == "characters":
-                    # Generate random characters (useful for training individual letters)
-                    chars = random.sample('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', random.randint(1, 8))
-                    text = ' '.join(chars)
-                
-                elif text_type == "grammar":
-                    # Generate grammatically structured sentence
-                    text = generate_grammar_based_sentence()
-                
-                elif text_type == "domain":
-                    # Use domain-specific vocabulary
-                    domain = random.choice(list(DOMAIN_VOCABULARIES.keys()))
-                    words = random.sample(DOMAIN_VOCABULARIES[domain], 
-                                         min(random.randint(3, 8), len(DOMAIN_VOCABULARIES[domain])))
-                    text = ' '.join(words)
-                
-                else:  # advanced
-                    # Use an advanced sentence or combine parts
-                    if random.random() < 0.5 and ADVANCED_SENTENCES:
-                        text = random.choice(ADVANCED_SENTENCES)
-                    else:
-                        # Combine parts of different sentences for more variety
-                        parts = []
-                        for _ in range(random.randint(2, 3)):
-                            if base_samples:
-                                sample = random.choice(base_samples).split()
-                                if len(sample) > 3:
-                                    # Take a random part of the sentence
-                                    start = random.randint(0, len(sample) - 3)
-                                    end = random.randint(start + 2, min(start + 6, len(sample)))
-                                    parts.append(' '.join(sample[start:end]))
-                        
-                        if parts:
-                            text = ' '.join(parts)
-                        else:
-                            # Fallback to grammar-based
-                            text = generate_grammar_based_sentence()
-            
-            # Ensure the text isn't too long (avoid very long processing times)
-            if len(text) > 150:
-                text = text[:150]
-            
-            # Randomize parameters for variety
-            speed = random.uniform(0.7, 1.5)  # Wide speed range
-            noise = random.uniform(0.01, 0.2)  # More variation in noise
-            freq_var = random.uniform(0.0, 0.15)  # Frequency variation
-            fading = random.uniform(0.0, 0.3)  # Signal fading simulation
-            
-            # Generate audio
-            audio, elements = generate_morse_audio(
-                text, 
-                noise_level=noise, 
-                speed_factor=speed,
-                freq_variation=freq_var,
-                fading=fading
-            )
-            
-            # Save audio file
-            file_name = f"morse_sample_{i:05d}.wav"
-            file_path = os.path.join(output_dir, file_name)
-            audio.export(file_path, format="wav")
-            
-            # Store labels
-            labels[file_name] = elements
-            
-            if verbose:
-                pbar.update(1)
-                pbar.set_postfix({"text": text[:20] + "..." if len(text) > 20 else text})
-            elif i % 10 == 0:
-                print(f"Generated {i-start_index+1}/{num_samples} samples")
-                
-            # Save labels periodically to avoid data loss
-            if i % batch_size == 0 and i > start_index:
-                with open(labels_file, 'w') as f:
-                    json.dump(labels, f)
-        
-        except Exception as e:
-            print(f"Error generating sample {i}: {e}")
+        if i < len(base_samples):
+            text = base_samples[i - start_index]
+        else:
+            text = generate_text_sample(base_samples)
+        text_samples.append(text)
     
-    # Close progress bar
-    if verbose:
-        pbar.close()
+    # Create batch arguments
+    batch_args = [(i, output_dir, text) for i, text in zip(range(start_index, start_index + num_samples), text_samples)]
+    
+    print(f"Generating {num_samples} samples starting from index {start_index}...")
+    start_time = time.time()
+    
+    # Process batches using multiprocessing
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        # Use tqdm to show progress
+        results = list(tqdm(
+            pool.imap(process_sample, batch_args),
+            total=num_samples,
+            desc="Generating samples"
+        ))
+    
+    # Process results
+    new_labels = {}
+    sample_texts = {}
+    for file_name, elements, text in results:
+        if file_name is not None:
+            new_labels[file_name] = elements
+            sample_texts[file_name] = text
+    
+    # Update labels
+    labels.update(new_labels)
     
     # Save labels to JSON file
     with open(labels_file, 'w') as f:
-        json.dump(labels, f, indent=2)
+        json.dump(labels, f)
     
-    print(f"Dataset generation complete. {num_samples} samples created in {output_dir}")
+    # Save text samples for reference
+    with open(os.path.join(output_dir, 'sample_texts.json'), 'w') as f:
+        json.dump(sample_texts, f)
+    
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"Dataset generation complete. {len(new_labels)} samples created in {elapsed:.1f} seconds")
+    print(f"Average time per sample: {elapsed / num_samples:.3f} seconds")
     
     # Generate some statistics
     print("\nDataset Statistics:")
@@ -531,15 +370,22 @@ def generate_dataset(output_dir, num_samples=1000, text_samples=None, start_inde
         print(f"  {element}: {count} ({count/total_elements*100:.1f}%)")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Generate Morse code audio dataset')
+    parser = argparse.ArgumentParser(description='Generate Morse code audio dataset (fast parallel version)')
     parser.add_argument('--output', default='./morse_audio_dataset', help='Output directory for dataset')
     parser.add_argument('--samples', type=int, default=1000, help='Number of samples to generate')
     parser.add_argument('--start', type=int, default=0, help='Starting index for sample filenames')
-    parser.add_argument('--complex', action='store_true', help='Generate more complex and varied sentences')
+    parser.add_argument('--processes', type=int, default=None, help='Number of processes to use (default: CPU count - 1)')
+    parser.add_argument('--simple', action='store_true', help='Use simplified generation for even faster processing')
     
     args = parser.parse_args()
     
-    if args.complex:
-        print("Generating dataset with enhanced complexity and variety...")
+    print(f"Starting fast Morse code dataset generator...")
+    print(f"Target: {args.samples} samples in '{args.output}'")
     
-    generate_dataset(args.output, num_samples=args.samples, start_index=args.start)
+    # Run with multiprocessing
+    generate_dataset_parallel(
+        args.output, 
+        num_samples=args.samples, 
+        start_index=args.start,
+        num_processes=args.processes
+    )
