@@ -97,18 +97,23 @@ def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_ste
     standardized_batch = []
     
     for feat in tqdm(features_batch, desc=f"Processing batch {batch_idx}"):
-        # Current shape and dimensions
-        freq_bins, time_steps = feat.shape
-        
-        # Create padded array
-        padded_feat = np.zeros((freq_bins, max_time_steps))
-        
-        # Copy original data
-        padded_feat[:, :time_steps] = feat
-        
-        # Add channel dimension for Conv2D
-        padded_feat = np.expand_dims(padded_feat, axis=-1)
-        standardized_batch.append(padded_feat)
+        # Check if feat already has channel dimension
+        if len(feat.shape) == 3 and feat.shape[-1] == 1:
+            # Already has channel dimension
+            standardized_batch.append(feat)
+        else:
+            # Current shape and dimensions
+            freq_bins, time_steps = feat.shape
+            
+            # Create padded array
+            padded_feat = np.zeros((freq_bins, max_time_steps))
+            
+            # Copy original data
+            padded_feat[:, :time_steps] = feat
+            
+            # Add channel dimension for Conv2D
+            padded_feat = np.expand_dims(padded_feat, axis=-1)
+            standardized_batch.append(padded_feat)
     
     # Convert to array
     standardized_batch = np.array(standardized_batch)
@@ -132,6 +137,7 @@ def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_ste
     # Clean up memory
     del standardized_batch
     gc.collect()
+
 
 def generate_synthetic_pause_samples(num_samples=1000, is_long=False, max_time_steps=None):
     """
@@ -357,6 +363,8 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     synthetic_features = []
     synthetic_labels = []
     
+    samples_per_class = min(class_counts['dot'], class_counts['dash'])
+
     if class_counts['short_pause'] == 0:
         # Generate synthetic short pause samples
         short_pause_features, short_pause_labels = generate_synthetic_pause_samples(
@@ -364,6 +372,10 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
             is_long=False,
             max_time_steps=max_time_steps
         )
+
+         # Process short pause features - add channel dimension
+        short_pause_features = [np.expand_dims(feat, axis=-1) for feat in short_pause_features]
+
         synthetic_features.extend(short_pause_features)
         synthetic_labels.extend(short_pause_labels)
         class_counts['short_pause'] = samples_per_class
@@ -375,6 +387,10 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
             is_long=True,
             max_time_steps=max_time_steps
         )
+
+        # Process long pause features - add channel dimension
+        long_pause_features = [np.expand_dims(feat, axis=-1) for feat in long_pause_features]
+        
         synthetic_features.extend(long_pause_features)
         synthetic_labels.extend(long_pause_labels)
         class_counts['long_pause'] = samples_per_class
@@ -389,7 +405,6 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
             labels_batch = synthetic_labels[batch_idx:batch_end]
             
             # Add channel dimension for Conv2D
-            features_batch = [np.expand_dims(feat, axis=-1) for feat in features_batch]
             
             # Process and save this batch
             process_batch_and_save(features_batch, labels_batch, 
