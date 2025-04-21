@@ -1,4 +1,17 @@
-morse_audio_to_text.py for audio to text
+train_morse_audio_to_text.py for audio to text
 morse_decoder.py predect
 morse_code_converter.py words to morese
 python morse_decoder.py morse_sample.wav
+# Generate 1000 samples
+python generate_larger_dataset.py --samples 1000 --output ./morse_audio_dataset
+
+# Add 2000 more samples (starting from 1000)
+python generate_larger_dataset.py --samples 2000 --start 1000 --output ./morse_audio_dataset
+
+# Generate 1000 samples
+python generate_larger_dataset.py --samples 1000 --output ./morse_audio_dataset
+
+# Add 2000 more samples (starting from 1000)
+python generate_larger_dataset.py --samples 2000 --start 1000 --output ./morse_audio_dataset
+
+python train_morse_model.py --dataset ./more_morse_samples/ --batch_size 32 --epochs 50

@@ -7,6 +7,9 @@ import os
 import json
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+import argparse
+from tqdm import tqdm
+import gc  # Garbage collection for memory management
 
 # Constants
 SAMPLE_RATE = 22050
@@ -16,7 +19,7 @@ N_FFT = 2048
 HOP_LENGTH = 512
 MORSE_ELEMENTS = ['dot', 'dash', 'short_pause', 'long_pause']
 
-# Morse code dictionary for decoding
+# Morse code dictionary for decoding (expanded with punctuation)
 MORSE_TO_TEXT = {
     '.-': 'A',     '-...': 'B',   '-.-.': 'C',   '-..': 'D',
     '.': 'E',      '..-.': 'F',   '--.': 'G',    '....': 'H',
@@ -27,7 +30,10 @@ MORSE_TO_TEXT = {
     '-.--': 'Y',   '--..': 'Z',
     '.----': '1',  '..---': '2',  '...--': '3',  '....-': '4',
     '.....': '5',  '-....': '6',  '--...': '7',  '---..': '8',
-    '----.': '9',  '-----': '0'
+    '----.': '9',  '-----': '0',
+    '.-.-.-': '.',  '--..--': ',',  '..--..': '?',  '-..-.': '/',
+    '-....-': '-',  '-.-.--': '!',  '.--.-': '@',  '---...': ':',
+    '.-.-': '+',    '-...-': '=',   '.-...': '&'
 }
 
 def load_and_preprocess_audio(file_path):
@@ -108,52 +114,100 @@ def create_model(input_shape, num_classes=4):
     
     return model
 
-def load_dataset(dataset_path, label_file):
+def load_dataset(dataset_path, label_file, max_samples=None, batch_processing=False):
     """
     Load dataset from directory
     
     Args:
         dataset_path: Path to directory containing audio files
         label_file: Path to JSON file containing labels
+        max_samples: Maximum number of samples to load (useful for testing)
+        batch_processing: Whether to process in batches to save memory
         
     Returns:
         X: Features
         y: Labels
     """
     # Load labels from JSON file
+    print(f"Loading labels from {label_file}")
     with open(label_file, 'r') as f:
         labels = json.load(f)
     
-    X = []
-    y = []
+    # Get list of available files
+    file_names = list(labels.keys())
     
-    for file_name, morse_elements in labels.items():
-        file_path = os.path.join(dataset_path, file_name)
-        
-        if not os.path.exists(file_path):
-            print(f"Warning: File {file_path} not found, skipping.")
-            continue
-        
-        try:
-            # Extract features
-            features = load_and_preprocess_audio(file_path)
-            X.append(features)
-            
-            # Convert labels to one-hot encoding
-            label_seq = []
-            for element in morse_elements:
-                one_hot = [0] * len(MORSE_ELEMENTS)
-                one_hot[MORSE_ELEMENTS.index(element)] = 1
-                label_seq.append(one_hot)
-            
-            y.append(label_seq)
-            
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
+    if max_samples and max_samples < len(file_names):
+        print(f"Limiting to {max_samples} samples")
+        file_names = file_names[:max_samples]
     
-    return np.array(X), np.array(y)
+    total_files = len(file_names)
+    print(f"Found {total_files} labeled files")
+    
+    if batch_processing:
+        # Return a generator to process files in batches
+        def dataset_generator():
+            for file_name in tqdm(file_names, desc="Processing audio files"):
+                file_path = os.path.join(dataset_path, file_name)
+                if not os.path.exists(file_path):
+                    continue
+                
+                try:
+                    # Extract features
+                    features = load_and_preprocess_audio(file_path)
+                    
+                    # Convert labels to one-hot encoding
+                    morse_elements = labels[file_name]
+                    label_seq = []
+                    for element in morse_elements:
+                        one_hot = [0] * len(MORSE_ELEMENTS)
+                        try:
+                            one_hot[MORSE_ELEMENTS.index(element)] = 1
+                            label_seq.append(one_hot)
+                        except ValueError:
+                            print(f"Warning: Unknown element '{element}' in {file_name}, skipping")
+                    
+                    yield features, np.array(label_seq)
+                    
+                except Exception as e:
+                    print(f"Error processing {file_path}: {e}")
+        
+        return dataset_generator, total_files
+    else:
+        # Process all files at once
+        X = []
+        y = []
+        
+        for file_name in tqdm(file_names, desc="Processing audio files"):
+            file_path = os.path.join(dataset_path, file_name)
+            
+            if not os.path.exists(file_path):
+                print(f"Warning: File {file_path} not found, skipping.")
+                continue
+            
+            try:
+                # Extract features
+                features = load_and_preprocess_audio(file_path)
+                X.append(features)
+                
+                # Convert labels to one-hot encoding
+                morse_elements = labels[file_name]
+                label_seq = []
+                for element in morse_elements:
+                    one_hot = [0] * len(MORSE_ELEMENTS)
+                    try:
+                        one_hot[MORSE_ELEMENTS.index(element)] = 1
+                        label_seq.append(one_hot)
+                    except ValueError:
+                        print(f"Warning: Unknown element '{element}' in {file_name}, skipping")
+                
+                y.append(label_seq)
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+        
+        return np.array(X), np.array(y)
 
-def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50):
+def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50, model_path='morse_recognition_model.h5'):
     """
     Train model with early stopping
     """
@@ -171,10 +225,16 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50)
             min_lr=1e-6
         ),
         keras.callbacks.ModelCheckpoint(
-            'morse_recognition_model.h5',
+            model_path,
             monitor='val_accuracy',
             save_best_only=True,
             verbose=1
+        ),
+        # Save model after each epoch to prevent data loss
+        keras.callbacks.ModelCheckpoint(
+            'morse_model_latest.h5',
+            save_best_only=False,
+            verbose=0
         )
     ]
     
@@ -199,22 +259,26 @@ def decode_morse_sequence(sequence):
         sequence: List of Morse elements ('dot', 'dash', 'short_pause', 'long_pause')
         
     Returns:
-        Decoded text
+        Decoded text and the morse code representation
     """
     current_char = []
     message = []
+    morse_code = ""
     
     for element in sequence:
         if element == 'dot':
             current_char.append('.')
+            morse_code += '.'
         elif element == 'dash':
             current_char.append('-')
+            morse_code += '-'
         elif element == 'short_pause' and current_char:
             # End of character
             morse_char = ''.join(current_char)
             if morse_char in MORSE_TO_TEXT:
                 message.append(MORSE_TO_TEXT[morse_char])
             current_char = []
+            morse_code += ' '
         elif element == 'long_pause':
             # End of word
             if current_char:
@@ -223,6 +287,7 @@ def decode_morse_sequence(sequence):
                     message.append(MORSE_TO_TEXT[morse_char])
                 current_char = []
             message.append(' ')
+            morse_code += ' / '
     
     # Handle any remaining character
     if current_char:
@@ -230,7 +295,7 @@ def decode_morse_sequence(sequence):
         if morse_char in MORSE_TO_TEXT:
             message.append(MORSE_TO_TEXT[morse_char])
     
-    return ''.join(message).strip()
+    return ''.join(message).strip(), morse_code.strip()
 
 def predict_from_audio(model, audio_file):
     """
@@ -259,9 +324,9 @@ def predict_from_audio(model, audio_file):
     morse_sequence = [MORSE_ELEMENTS[idx] for idx in predicted_classes[0]]
     
     # Decode Morse sequence to text
-    decoded_text = decode_morse_sequence(morse_sequence)
+    decoded_text, morse_code = decode_morse_sequence(morse_sequence)
     
-    return decoded_text
+    return decoded_text, morse_code
 
 def plot_training_history(history):
     """
@@ -293,12 +358,35 @@ def main():
     """
     Main function to train model and make predictions
     """
-    # Path to your dataset - REPLACE WITH YOUR ACTUAL PATHS
-    dataset_path = "./morse_audio_dataset/"
-    label_file = "./morse_labels.json"
+    parser = argparse.ArgumentParser(description='Train Morse code recognition model')
+    parser.add_argument('--dataset', default='./morse_audio_dataset/', help='Path to dataset directory')
+    parser.add_argument('--labels', help='Path to labels file (JSON)')
+    parser.add_argument('--max_samples', type=int, help='Maximum number of samples to load')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs for training')
+    parser.add_argument('--model_path', default='morse_recognition_model.h5', help='Path to save model')
+    parser.add_argument('--test_file', help='Audio file to test after training')
+    
+    args = parser.parse_args()
+    
+    # Determine labels file path if not specified
+    if args.labels is None:
+        args.labels = os.path.join(args.dataset, 'morse_labels.json')
+    
+    print(f"Using dataset: {args.dataset}")
+    print(f"Using labels: {args.labels}")
+    
+    # Check if dataset and labels exist
+    if not os.path.exists(args.dataset):
+        print(f"Error: Dataset directory {args.dataset} not found.")
+        return
+    
+    if not os.path.exists(args.labels):
+        print(f"Error: Labels file {args.labels} not found.")
+        return
     
     print("Loading and preprocessing dataset...")
-    X, y = load_dataset(dataset_path, label_file)
+    X, y = load_dataset(args.dataset, args.labels, max_samples=args.max_samples)
     
     # Split into train and validation sets
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -311,20 +399,30 @@ def main():
     model.summary()
     
     # Train the model
-    print("Training model...")
-    model, history = train_model(model, X_train, y_train, X_val, y_val)
+    print(f"Training model with batch size {args.batch_size} for {args.epochs} epochs...")
+    model, history = train_model(
+        model, X_train, y_train, X_val, y_val, 
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        model_path=args.model_path
+    )
     
     # Plot training history
     plot_training_history(history)
     
     # Save the model
-    model.save('morse_recognition_model.h5')
-    print("Model saved as 'morse_recognition_model.h5'")
+    model.save(args.model_path)
+    print(f"Model saved as '{args.model_path}'")
     
     # Example prediction
-    test_file = input("Enter path to a Morse code audio file to test (or press Enter to skip): ")
+    test_file = args.test_file
+    if test_file is None:
+        test_file = input("Enter path to a Morse code audio file to test (or press Enter to skip): ")
+    
     if test_file and os.path.exists(test_file):
-        decoded_text = predict_from_audio(model, test_file)
+        decoded_text, morse_code = predict_from_audio(model, test_file)
+        print("\nResults:")
+        print(f"Decoded Morse code: {morse_code}")
         print(f"Decoded text: {decoded_text}")
 
 if __name__ == "__main__":
