@@ -211,11 +211,16 @@ def load_dataset(dataset_path, label_file, max_samples=None):
 
 def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50, model_path='morse_recognition_model.h5'):
     """
-    Train model with early stopping
+    Train model with early stopping and save a checkpoint after each epoch
     """
     # Get directory from model_path
     model_dir = os.path.dirname(model_path)
     latest_model_path = os.path.join(model_dir, 'latest_model_v2.h5')
+    
+    # Create a directory for epoch checkpoints
+    checkpoints_dir = os.path.join(model_dir, 'epoch_checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    print(f"Epoch checkpoints will be saved to: {checkpoints_dir}")
     
     # Define callbacks for training
     callbacks = [
@@ -241,6 +246,13 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
             latest_model_path,
             save_best_only=False,
             verbose=0
+        ),
+        # Save a separate checkpoint for each epoch
+        keras.callbacks.ModelCheckpoint(
+            os.path.join(checkpoints_dir, 'morse_model_epoch_{epoch:03d}.h5'),
+            save_best_only=False,
+            save_weights_only=False,
+            verbose=1
         )
     ]
     
@@ -255,6 +267,7 @@ def train_model(model, X_train, y_train, X_val, y_val, batch_size=32, epochs=50,
         verbose=1
     )
     
+    print(f"Epoch checkpoints saved to: {checkpoints_dir}")
     return model, history
 
 def decode_morse_sequence(sequence):
@@ -390,6 +403,7 @@ def main():
     print(f"Using labels: {args.labels}")
     print(f"Model will be saved to: {args.model_path}")
     print(f"Latest model will be saved as: {os.path.join(save_dir, 'latest_model_v2.h5')}")
+    print(f"Per-epoch checkpoints will be saved in: {os.path.join(save_dir, 'epoch_checkpoints')}")
     
     # Check if dataset and labels exist
     if not os.path.exists(args.dataset):
