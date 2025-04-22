@@ -9,29 +9,26 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import argparse
 from tqdm import tqdm
-import gc  # Garbage collection for memory management
+import gc 
 import datetime
-import h5py  # For efficient storage of large arrays
-import random  # For random shuffling
+import h5py  
+import random  
 
-# Create the directory for saved models if it doesn't exist
 save_dir = r"D:\Bunny\MorseCode\backend\scipts\saved_models"
 os.makedirs(save_dir, exist_ok=True)
 
-# Create a directory for temporary storage
 temp_dir = os.path.join(save_dir, "temp_data")
 os.makedirs(temp_dir, exist_ok=True)
 
-# Constants
 SAMPLE_RATE = 22050
-DURATION = 30  # max duration in seconds to analyze
+DURATION = 30 
 N_MELS = 128
 N_FFT = 2048
 HOP_LENGTH = 512
 MORSE_ELEMENTS = ['dot', 'dash', 'short_pause', 'long_pause']
-BATCH_SIZE_PROCESSING = 1000  # Process data in smaller batches to reduce memory usage
+BATCH_SIZE_PROCESSING = 1000  
 
-# Morse code dictionary for decoding (expanded with punctuation)
+
 MORSE_TO_TEXT = {
     '.-': 'A',     '-...': 'B',   '-.-.': 'C',   '-..': 'D',
     '.': 'E',      '..-.': 'F',   '--.': 'G',    '....': 'H',
@@ -59,10 +56,10 @@ def load_and_preprocess_audio(file_path, fixed_time_steps=None):
     Returns:
         Mel spectrogram features
     """
-    # Load audio file with librosa
+    
     y, sr = librosa.load(file_path, sr=SAMPLE_RATE, duration=DURATION)
     
-    # Extract mel spectrogram features
+    
     mel_spec = librosa.feature.melspectrogram(
         y=y, 
         sr=sr, 
@@ -71,15 +68,14 @@ def load_and_preprocess_audio(file_path, fixed_time_steps=None):
         n_mels=N_MELS
     )
     
-    # Convert to decibels
+    
     mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
     
-    # Normalize
+    
     mel_spec_db = (mel_spec_db - np.min(mel_spec_db)) / (np.max(mel_spec_db) - np.min(mel_spec_db))
     
-    # If fixed_time_steps is provided, resize the spectrogram
+
     if fixed_time_steps is not None and mel_spec_db.shape[1] > fixed_time_steps:
-        # Trim if longer than fixed_time_steps
         mel_spec_db = mel_spec_db[:, :fixed_time_steps]
     
     return mel_spec_db
@@ -97,12 +93,9 @@ def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_ste
     standardized_batch = []
     
     for feat in tqdm(features_batch, desc=f"Processing batch {batch_idx}"):
-        # Check if feat already has channel dimension
         if len(feat.shape) == 3 and feat.shape[-1] == 1:
-            # Already has channel dimension
             standardized_batch.append(feat)
         else:
-            # Current shape and dimensions
             freq_bins, time_steps = feat.shape
             
             # Create padded array
@@ -115,26 +108,21 @@ def process_batch_and_save(features_batch, labels_batch, batch_idx, max_time_ste
             padded_feat = np.expand_dims(padded_feat, axis=-1)
             standardized_batch.append(padded_feat)
     
-    # Convert to array
     standardized_batch = np.array(standardized_batch)
     
-    # Save batch to HDF5 file
     with h5py.File(output_file, 'a') as f:
-        # Create dataset for this batch if it doesn't exist
         if 'features' not in f:
             f.create_dataset('features', data=standardized_batch, maxshape=(None, *standardized_batch.shape[1:]), 
                            chunks=True, compression='gzip', compression_opts=4)
             f.create_dataset('labels', data=np.array(labels_batch), maxshape=(None, len(labels_batch[0])), 
                            chunks=True)
         else:
-            # Append to existing dataset
             f['features'].resize((f['features'].shape[0] + standardized_batch.shape[0]), axis=0)
             f['features'][-standardized_batch.shape[0]:] = standardized_batch
             
             f['labels'].resize((f['labels'].shape[0] + len(labels_batch)), axis=0)
             f['labels'][-len(labels_batch):] = np.array(labels_batch)
     
-    # Clean up memory
     del standardized_batch
     gc.collect()
 
@@ -157,7 +145,7 @@ def generate_synthetic_pause_samples(num_samples=1000, is_long=False, max_time_s
     labels_list = []
     pause_type = 'long_pause' if is_long else 'short_pause'
     
-    duration = 0.7 if is_long else 0.3  # Long pause vs short pause duration
+    duration = 0.7 if is_long else 0.3  
     sr = SAMPLE_RATE
     
     for i in range(num_samples):
@@ -184,7 +172,6 @@ def generate_synthetic_pause_samples(num_samples=1000, is_long=False, max_time_s
         
         features_list.append(mel_spec_db)
         
-        # Create one-hot label
         label = [0] * len(MORSE_ELEMENTS)
         label[MORSE_ELEMENTS.index(pause_type)] = 1
         labels_list.append(label)
@@ -202,10 +189,8 @@ def create_model(input_shape, num_classes=4):
     Returns:
         Compiled Keras model
     """
-    # Input layer
     inputs = keras.Input(shape=input_shape, name="input_layer")
     
-    # Convolutional layers
     x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.BatchNormalization()(x)
@@ -217,11 +202,9 @@ def create_model(input_shape, num_classes=4):
     x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
     x = layers.GlobalAveragePooling2D()(x)
     
-    # Dense layers
     x = layers.Dense(256, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
     
-    # Output layer
     outputs = layers.Dense(num_classes, activation='softmax')(x)
     
     model = keras.Model(inputs, outputs)
@@ -245,12 +228,10 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
         max_samples: Maximum number of samples to load (useful for testing)
         sample_limit_per_class: Maximum number of samples per class to balance the dataset
     """
-    # Load labels from JSON file
     print(f"Loading labels from {label_file}")
     with open(label_file, 'r') as f:
         labels = json.load(f)
     
-    # Get list of available files
     file_names = list(labels.keys())
     
     if max_samples and max_samples < len(file_names):
@@ -260,16 +241,15 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     total_files = len(file_names)
     print(f"Found {total_files} labeled files")
     
-    # Count samples per class
     class_counts = {element: 0 for element in MORSE_ELEMENTS}
     filtered_files = []
     file_by_class = {element: [] for element in MORSE_ELEMENTS}
     
     for file_name in file_names:
-        if not labels[file_name]:  # Skip files with empty labels
+        if not labels[file_name]: 
             continue
             
-        morse_element = labels[file_name][0]  # Use first element as label
+        morse_element = labels[file_name][0]  
         if morse_element in MORSE_ELEMENTS:
             class_counts[morse_element] += 1
             file_by_class[morse_element].append(file_name)
@@ -278,34 +258,28 @@ def process_and_save_dataset(dataset_path, label_file, output_file, max_samples=
     for element, count in class_counts.items():
         print(f"  {element}: {count} samples")
     
-    # Check if we have a balanced dataset or need to create one
     missing_classes = [cls for cls, count in class_counts.items() if count == 0]
     
     if missing_classes:
         print(f"Missing samples for classes: {', '.join(missing_classes)}")
         print("Creating balanced dataset...")
         
-        # Get available classes and their counts
         available_classes = [cls for cls, count in class_counts.items() if count > 0]
         
-        # Determine target count per class (equal samples per class)
         if len(available_classes) == 0:
             print("Error: No valid classes found in dataset")
             return 0
         
-        # For dot and dash only, create balanced classes
         samples_per_class = min(class_counts['dot'], class_counts['dash']) 
         if max_samples and (samples_per_class * 2 > max_samples):
-            samples_per_class = max_samples // 2  # Divide evenly between classes
+            samples_per_class = max_samples // 2  
         
         samples_per_class = min(samples_per_class, sample_limit_per_class)
         print(f"Balancing to {samples_per_class} samples per class")
         
-        # Randomly shuffle files in each class
         for cls in available_classes:
             random.shuffle(file_by_class[cls])
         
-        # Create balanced dataset
         balanced_files = []
         balanced_counts = {element: 0 for element in MORSE_ELEMENTS}
         
