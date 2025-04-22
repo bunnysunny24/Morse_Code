@@ -17,3 +17,5 @@ python generate_larger_dataset.py --samples 2000 --start 1000 --output ./morse_a
 python train_morse_model.py --dataset ./more_morse_samples/ --batch_size 32 --epochs 50
 python train_morse_model.py --dataset "D:\Bunny\MorseCode\backend\scipts\morse_audio_dataset" --batch_size 32 --epochs 10
 D:\Bunny\MorseCode\backend\scipts\saved_models\morse_recognition_model_v2.h5
+python predict.py --audio "path_to_morse_audio.wav"
+python predict.py --audio "D:\Bunny\MorseCode\backend\data\F_Around_The_World_In_80_Days_19-27\000-127\013_Around_The_World_In_80_Days.mp3"     
